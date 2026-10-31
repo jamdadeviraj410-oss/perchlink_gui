@@ -1,7 +1,8 @@
 """
 LoRa Communication Service
-Integrates the proven PerchLinkLoRa hardware controller (LILYGO T3-S3 SX1262)
-with fallback simulation when physical hardware is not plugged in.
+Interfaces with the LILYGO T3-S3 SX1262 via PerchLinkLoRa.
+CRITICAL SAFETY RULE: When MOCK_LORA is False, NO simulated ACKs are permitted.
+Missing hardware or radio timeouts are strictly reported as failures.
 """
 import asyncio
 import logging
@@ -23,10 +24,10 @@ class LoRaService:
 
     def start(self):
         if self.is_mock:
-            logger.warning("[LORA] Configured for MOCK SIMULATION MODE. Physical radio bypassed.")
+            logger.warning("[LORA] MOCK_LORA=True. Running in explicit local simulation mode.")
             return
 
-        logger.info(f"[LORA] Initializing physical PerchLinkLoRa controller on {settings.LORA_PORT} ({settings.LORA_BAUD_RATE} baud)...")
+        logger.info(f"[LORA] Starting STRICT HARDWARE mode on {settings.LORA_PORT} ({settings.LORA_BAUD_RATE} baud)...")
         try:
             self.controller = PerchLinkLoRa(
                 port=settings.LORA_PORT,
@@ -35,21 +36,18 @@ class LoRaService:
                 reconnect_delay=3.0
             )
             self.controller.start()
-
-            # Start background event consumer in asyncio loop
             self.event_listener_task = asyncio.create_task(self._consume_lora_events())
-            logger.info("[LORA] PerchLinkLoRa serial thread and event consumer started.")
+            logger.info("[LORA] PerchLinkLoRa hardware controller thread started.")
         except Exception as e:
-            logger.error(f"[LORA] Could not initialize physical serial port: {e}. Falling back to simulation.")
-            self.is_mock = True
+            logger.error(f"[LORA] Hardware initialization failed on {settings.LORA_PORT}: {e}")
+            self.hardware_connected = False
 
     async def _consume_lora_events(self):
         """
-        Continuously read events produced by PerchLinkLoRa background worker thread
+        Consume real hardware events from PerchLinkLoRa
         """
         while True:
             try:
-                # Run blocking get_event in thread pool with small timeout
                 event = await asyncio.to_thread(self.controller.get_event, 0.2)
                 if not event:
                     await asyncio.sleep(0.05)
@@ -59,35 +57,33 @@ class LoRaService:
 
                 if etype == "connected":
                     self.hardware_connected = True
-                    logger.info(f"[LORA HW] Serial connection active on {event.get('port')}")
+                    logger.info(f"[LORA HW] Physical radio serial connection active on {event.get('port')}")
 
-                elif etype == "connection_error" or etype == "connection_lost":
+                elif etype in ("connection_error", "connection_lost"):
                     self.hardware_connected = False
-                    logger.warning(f"[LORA HW] Serial disconnected: {event.get('error')}")
+                    logger.warning(f"[LORA HW] Radio serial disconnected: {event.get('error')}")
 
                 elif etype == "sent":
-                    logger.info(f"[LORA HW] Radio packet transmitted: {event.get('command')}")
+                    logger.info(f"[LORA HW] Broadcasted radio packet: {event.get('command')}")
 
                 elif etype == "sos_result":
                     event_id = event.get("event_id")
                     delivered = event.get("delivered", False)
                     failed = event.get("failed", False)
 
-                    logger.info(f"[LORA HW] SOS Result for {event_id}: delivered={delivered}, failed={failed}")
+                    logger.info(f"[LORA HW] Hardware event for {event_id}: delivered={delivered}, failed={failed}")
 
-                    if delivered and event_id in self.pending_acks:
+                    if event_id in self.pending_acks:
                         on_ack, on_operator_ack = self.pending_acks.pop(event_id)
-                        ack_time = datetime.now(timezone.utc)
-                        # Ground Station radio ACK confirmed over-the-air!
-                        await on_ack(event_id, ack_time)
-
-                        # Operator review confirmation simulation / hook
-                        await asyncio.sleep(6)
-                        op_time = datetime.now(timezone.utc)
-                        await on_operator_ack(event_id, op_time)
+                        if delivered:
+                            ack_time = datetime.now(timezone.utc)
+                            logger.info(f"[LORA HW] Over-the-air RF_ACK confirmed for {event_id}!")
+                            await on_ack(event_id, ack_time)
+                        else:
+                            logger.warning(f"[LORA HW] Delivery unconfirmed for {event_id}. Keeping record pending.")
 
                 elif etype == "timeout":
-                    logger.warning(f"[LORA HW] Radio ACK timed out for command: {event.get('command')}")
+                    logger.warning(f"[LORA HW] Timeout: No over-the-air RF_ACK received for {event.get('command')}")
 
             except asyncio.CancelledError:
                 break
@@ -97,9 +93,7 @@ class LoRaService:
 
     async def transmit_packet(self, packet_data: dict, on_ack: Callable, on_operator_ack: Callable):
         """
-        Transmit emergency distress packet over LoRa radio
-        Format expected by PerchLink_Drone_V1.ino:
-        SOS,event_id,latitude,longitude,timestamp
+        Transmit emergency distress packet.
         """
         sos_id = packet_data.get("sos_id")
         lat = packet_data.get("lat") if packet_data.get("lat") is not None else 0.0
@@ -108,26 +102,26 @@ class LoRaService:
 
         command = f"SOS,{sos_id},{lat:.6f},{lon:.6f},{ts}"
 
-        # If hardware controller is active and serial is connected:
-        if not self.is_mock and self.controller and self.hardware_connected:
-            logger.info(f"[LORA HW] Dispatching command to LILYGO SX1262: {command}")
-            self.pending_acks[sos_id] = (on_ack, on_operator_ack)
-            try:
-                self.controller.send_sos_command(command)
+        # 1. STRICT HARDWARE MODE (Production & Real Hardware Testing)
+        if not self.is_mock:
+            if not self.controller or not self.hardware_connected:
+                logger.error(f"[LORA HW] Cannot transmit {sos_id}: Physical LILYGO radio on {settings.LORA_PORT} is not connected!")
+                # Strict safety: Do NOT fake an ACK. The request stays pending in SQLite.
                 return
-            except Exception as e:
-                logger.error(f"[LORA HW] Failed to queue command: {e}. Falling back to simulation.")
 
-        # Fallback Simulation if hardware is not connected or in mock mode
-        logger.info(f"[LORA SIMULATION] Simulating RF propagation for {sos_id}...")
+            logger.info(f"[LORA HW] Submitting command to radio: {command}")
+            self.pending_acks[sos_id] = (on_ack, on_operator_ack)
+            self.controller.send_sos_command(command)
+            return
+
+        # 2. EXPLICIT MOCK MODE (Only when MOCK_LORA=True in development)
+        logger.info(f"[LORA MOCK] Simulating RF propagation for {sos_id} (explicit mock flag enabled)...")
         await asyncio.sleep(4)
         ack_timestamp = datetime.now(timezone.utc)
-        logger.info(f"[LORA SIMULATION] Ground Station returned simulated RF_ACK for {sos_id}.")
         await on_ack(sos_id, ack_timestamp)
 
         await asyncio.sleep(8)
         op_timestamp = datetime.now(timezone.utc)
-        logger.info(f"[LORA SIMULATION] Rescue Operator dispatched simulated acknowledgment for {sos_id}.")
         await on_operator_ack(sos_id, op_timestamp)
 
 lora_service = LoRaService()
