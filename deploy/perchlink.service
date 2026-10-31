@@ -1,0 +1,21 @@
+[Unit]
+Description=PerchLink Survivor SOS Drone Relay Service
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/perchlink/backend
+ExecStart=/home/pi/perchlink/backend/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+# Hardware environment
+Environment=PYTHONUNBUFFERED=1
+Environment=LORA_PORT=/dev/ttyACM0
+Environment=LORA_BAUD_RATE=115200
+Environment=MOCK_LORA=false
+Environment=MAVLINK_CONNECTION=/dev/ttyAMA0
+
+[Install]
+WantedBy=multi-user.target

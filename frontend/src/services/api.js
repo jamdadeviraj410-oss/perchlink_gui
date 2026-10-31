@@ -1,24 +1,39 @@
-// PerchLink Survivor SOS - Local API Service
-// Designed for local-only, offline execution on Raspberry Pi 4B
+// PerchLink Survivor SOS - Local API Service (Phase 3 Full Integration)
+// Supports seamless offline operation and real FastAPI backend integration
 
 const STORAGE_KEY_SOS_LIST = 'perchlink_sos_records';
 const STORAGE_KEY_ACTIVE_SOS = 'perchlink_active_sos_id';
 
-// Check if running in mock/demo mode or connected to live FastAPI backend
-const IS_PRODUCTION_BACKEND = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
-const API_BASE_URL = IS_PRODUCTION_BACKEND ? '/api' : 'http://localhost:8000/api';
+// Use relative API path; Vite proxy forwards to localhost:8000 in dev, FastAPI serves directly in prod
+const API_BASE_URL = '/api';
 
 /**
- * Generate a sequential or unique SOS ID (e.g. SOS-7429)
+ * Check if the real FastAPI backend is accessible
  */
-function generateSOSId() {
-  const prefix = 'SOS';
+export async function checkBackendConnection() {
+  try {
+    const res = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (res.ok) {
+      const data = await res.json();
+      return data.status === 'healthy' || data.databaseOk === true;
+    }
+  } catch (e) {
+    // Backend unreachable
+  }
+  return false;
+}
+
+/**
+ * Generate a fallback ID only if backend is unreachable
+ */
+function generateLocalSOSId() {
+  const prefix = 'SOS-LOCAL';
   const num = Math.floor(1000 + Math.random() * 9000);
   return `${prefix}-${num}`;
 }
 
 /**
- * Helper to get all locally stored SOS cases
+ * Read locally cached emergency cases from browser storage
  */
 export function getStoredSOSRecords() {
   try {
@@ -31,7 +46,7 @@ export function getStoredSOSRecords() {
 }
 
 /**
- * Helper to save an SOS case locally
+ * Cache SOS case in browser storage
  */
 export function saveSOSRecord(record) {
   try {
@@ -50,7 +65,7 @@ export function saveSOSRecord(record) {
 }
 
 /**
- * Get active SOS ID if user recently submitted one
+ * Get active SOS ID if survivor recently submitted one
  */
 export function getActiveSOSId() {
   return localStorage.getItem(STORAGE_KEY_ACTIVE_SOS) || null;
@@ -64,70 +79,83 @@ export function clearActiveSOSId() {
 }
 
 /**
- * Submit New Emergency Request
- * Phase 1: Local simulated storage with fallback to mock flow
- * Phase 2/3: Sends real POST to /api/sos
+ * Submit New Emergency Request (Phase 3: Real POST /api/sos)
  */
 export async function submitSOS(payload) {
-  // If backend endpoint is available in future phases:
+  const requestBody = {
+    emergencyType: payload.emergencyType || 'OTHER',
+    peopleCount: payload.peopleCount || 1,
+    location: payload.location || null,
+    landmark: payload.landmark || null,
+    message: payload.message || null,
+  };
+
   try {
     const response = await fetch(`${API_BASE_URL}/sos`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(requestBody),
     });
+
     if (response.ok) {
       const data = await response.json();
       saveSOSRecord(data);
+      console.info(`[API] Successfully created SOS case ${data.id} on backend database.`);
       return data;
+    } else {
+      const errData = await response.json().catch(() => ({}));
+      console.warn('[API] Backend rejected SOS submission:', errData);
     }
   } catch (err) {
-    // Backend not running yet (Phase 1 mode) -> fallback to simulated local store
-    console.warn('API unavailable, running in Phase 1 Simulated Mode:', err.message);
+    console.warn('[API] Backend offline or unreachable. Falling back to local offline queue:', err.message);
   }
 
-  // Simulated Phase 1 implementation
-  const sosId = generateSOSId();
+  // Fallback if backend is temporarily disconnected
+  const localId = generateLocalSOSId();
   const timestamp = new Date().toISOString();
 
-  const mockRecord = {
-    id: sosId,
-    emergencyType: payload.emergencyType || 'OTHER',
-    peopleCount: payload.peopleCount || 1,
-    location: payload.location || null,
-    landmark: payload.landmark || '',
-    message: payload.message || '',
+  const fallbackRecord = {
+    id: localId,
+    emergencyType: requestBody.emergencyType,
+    peopleCount: requestBody.peopleCount,
+    location: requestBody.location,
+    landmark: requestBody.landmark || '',
+    message: requestBody.message || '',
     additionalMessages: [],
     createdAt: timestamp,
     updatedAt: timestamp,
-    status: 'RECEIVED_BY_DRONE', // Drone received and saved locally
-    droneReceived: true,
-    droneReceivedAt: timestamp,
+    droneReceived: false,
+    droneReceivedAt: null,
+    status: 'SUBMITTING',
     transmittingLoRa: false,
     groundStationAcknowledged: false,
     groundStationAcknowledgedAt: null,
     rescueTeamAcknowledged: false,
     rescueTeamAcknowledgedAt: null,
-    isSimulated: true, // Transparent simulation indicator
+    isSimulated: true,
   };
 
-  saveSOSRecord(mockRecord);
-  return mockRecord;
+  saveSOSRecord(fallbackRecord);
+  return fallbackRecord;
 }
 
 /**
- * Fetch SOS record by ID
+ * Fetch SOS record by ID (Phase 3: Real GET /api/sos/{id})
  */
 export async function getSOSById(sosId) {
   if (!sosId) return null;
 
   try {
-    const response = await fetch(`${API_BASE_URL}/sos/${sosId}`);
+    const response = await fetch(`${API_BASE_URL}/sos/${sosId}`, {
+      signal: AbortSignal.timeout(3000),
+    });
     if (response.ok) {
-      return await response.json();
+      const liveData = await response.json();
+      saveSOSRecord(liveData);
+      return liveData;
     }
   } catch (err) {
-    // Fall back to local store
+    // Network error -> read from local cache
   }
 
   const records = getStoredSOSRecords();
@@ -135,7 +163,7 @@ export async function getSOSById(sosId) {
 }
 
 /**
- * Submit additional info / update to an existing SOS
+ * Submit additional info to an existing SOS (Phase 3: Real POST /api/sos/{id}/update)
  */
 export async function updateSOSMessage(sosId, additionalMessage) {
   try {
@@ -144,55 +172,55 @@ export async function updateSOSMessage(sosId, additionalMessage) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: additionalMessage }),
     });
+
     if (response.ok) {
       const updated = await response.json();
       saveSOSRecord(updated);
       return updated;
     }
   } catch (err) {
-    // Fallback in Phase 1
+    console.warn('[API] Could not send note to backend:', err.message);
   }
 
+  // Fallback cache update
   const record = await getSOSById(sosId);
   if (!record) return null;
-
-  const updateEntry = {
-    text: additionalMessage,
-    timestamp: new Date().toISOString(),
-  };
 
   if (!record.additionalMessages) {
     record.additionalMessages = [];
   }
-  record.additionalMessages.push(updateEntry);
+  record.additionalMessages.push({
+    text: additionalMessage,
+    timestamp: new Date().toISOString(),
+  });
   saveSOSRecord(record);
   return record;
 }
 
 /**
- * Get Drone Hardware & Telemetry Status
- * GET /api/drone/status
+ * Get Drone Hardware & Telemetry Status (Phase 3: Real GET /api/drone/status)
  */
 export async function fetchDroneStatus() {
   try {
-    const response = await fetch(`${API_BASE_URL}/drone/status`);
+    const response = await fetch(`${API_BASE_URL}/drone/status`, {
+      signal: AbortSignal.timeout(3000),
+    });
     if (response.ok) {
       return await response.json();
     }
   } catch (err) {
-    // Fall back to simulated telemetry
+    // Fall back to offline defaults
   }
 
-  // Simulated hardware state for Phase 1
   return {
     wifiAvailable: true,
     ssid: 'PERCHLINK_SOS',
     ip: '192.168.4.1',
-    droneStatus: 'PERCHED', // Options: PERCHED, HOVERING, SEARCHING
-    loraStatus: 'CONNECTED', // Options: CONNECTED, TRANSMITTING, SEARCHING, DISCONNECTED
-    batteryPercentage: 86,
+    droneStatus: 'PERCHED',
+    loraStatus: 'CONNECTED',
+    batteryPercentage: null,
     groundStationConnected: true,
-    isSimulated: true, // Explicitly tagged as per Section 20 guidelines
+    isSimulated: true,
     timestamp: new Date().toISOString(),
   };
 }

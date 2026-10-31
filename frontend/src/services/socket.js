@@ -1,5 +1,5 @@
-// PerchLink Survivor SOS - Real-time WebSocket & Status Simulator
-// Provides real WebSocket connectivity with automatic fallback to Phase 1 Simulation
+// PerchLink Survivor SOS - Real-Time WebSocket Service (Phase 3 Integration)
+// Connects to live FastAPI /ws/sos/{id} endpoint with automatic recovery and fallback
 
 import { getSOSById, saveSOSRecord } from './api';
 
@@ -8,9 +8,10 @@ class SOSSocketService {
     this.socket = null;
     this.listeners = new Map();
     this.activeSosId = null;
-    this.simulationTimers = [];
     this.reconnectTimeout = null;
+    this.pingInterval = null;
     this.isConnected = false;
+    this.isLive = false;
   }
 
   /**
@@ -37,147 +38,95 @@ class SOSSocketService {
   }
 
   /**
-   * Connect WebSocket or initiate Phase 1 simulation
+   * Connect to real FastAPI WebSocket endpoint: /ws/sos/{sosId}
    */
   connect(sosId) {
     this.activeSosId = sosId;
-    this.clearTimers();
+    this.clearPing();
 
-    const host = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
-      ? 'localhost:8000' 
-      : window.location.host;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${host}/ws/sos/${sosId}`;
+    // In dev: proxy on port 5173 forwards /ws to localhost:8000
+    // In prod: direct connection to Raspberry Pi port 80/8000
+    const wsUrl = `${protocol}//${window.location.host}/ws/sos/${sosId}`;
 
     try {
       this.socket = new WebSocket(wsUrl);
 
       this.socket.onopen = () => {
         this.isConnected = true;
+        this.isLive = true;
+        console.info(`[WS] Connected to live backend WebSocket for case ${sosId}`);
+
+        // Start ping heartbeat every 10 seconds
+        this.pingInterval = setInterval(() => {
+          if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send('ping');
+          }
+        }, 10000);
+
         this.emitStatus(sosId, { event: 'connected', isLiveWs: true });
       };
 
-      this.socket.onmessage = (event) => {
+      this.socket.onmessage = async (event) => {
+        if (event.data === 'pong') return;
+
         try {
           const data = JSON.parse(event.data);
+          console.info(`[WS] Live event received for ${sosId}:`, data.event);
+
+          // Update local cache with live progress
+          const current = await getSOSById(sosId);
+          if (current) {
+            if (data.status) current.status = data.status;
+            if (data.event === 'sos_transmission_started') {
+              current.transmittingLoRa = true;
+            } else if (data.event === 'sos_received_by_ground_station') {
+              current.transmittingLoRa = false;
+              current.groundStationAcknowledged = true;
+              current.groundStationAcknowledgedAt = data.timestamp;
+            } else if (data.event === 'rescue_team_acknowledged') {
+              current.rescueTeamAcknowledged = true;
+              current.rescueTeamAcknowledgedAt = data.timestamp;
+            }
+            saveSOSRecord(current);
+          }
+
           this.emitStatus(sosId, data);
         } catch (e) {
-          console.error('Error parsing WebSocket message:', e);
+          console.error('[WS] Error parsing message payload:', e);
         }
       };
 
-      this.socket.onerror = () => {
-        // Fall back to simulation in Phase 1
-        this.fallbackToSimulation(sosId);
+      this.socket.onerror = (e) => {
+        console.warn(`[WS] Connection issue on ${wsUrl}`);
       };
 
-      this.socket.onclose = () => {
+      this.socket.onclose = async () => {
         this.isConnected = false;
-        // Schedule reconnect attempt
-        this.reconnectTimeout = setTimeout(() => {
-          if (this.listeners.has(sosId)) {
-            this.connect(sosId);
+        this.isLive = false;
+        this.clearPing();
+        console.info(`[WS] Disconnected from ${sosId}. Recovering status via REST API...`);
+
+        // Requirement (plan.md:L491): Fetch current SOS status through REST API if WS disconnects
+        try {
+          const fresh = await getSOSById(sosId);
+          if (fresh) {
+            this.emitStatus(sosId, { event: 'recovered_from_rest', ...fresh });
           }
-        }, 5000);
+        } catch (err) {}
+
+        // Schedule automatic reconnect attempt
+        if (this.listeners.has(sosId)) {
+          this.reconnectTimeout = setTimeout(() => {
+            if (this.listeners.has(sosId)) {
+              this.connect(sosId);
+            }
+          }, 3000);
+        }
       };
     } catch (e) {
-      this.fallbackToSimulation(sosId);
+      console.warn('[WS] Could not initialize WebSocket, will retry:', e.message);
     }
-  }
-
-  /**
-   * Fallback simulator for Phase 1 testing
-   */
-  async fallbackToSimulation(sosId) {
-    this.clearTimers();
-    const current = await getSOSById(sosId);
-    if (!current) return;
-
-    // Stage 1: Received by Drone (Already true on submit)
-    this.emitStatus(sosId, {
-      event: 'sos_received_by_drone',
-      sosId,
-      status: 'RECEIVED_BY_DRONE',
-      timestamp: current.droneReceivedAt || new Date().toISOString(),
-      isSimulated: true,
-      message: 'Emergency request stored securely on drone storage',
-    });
-
-    // If already fully acknowledged, don't re-run timeline
-    if (current.rescueTeamAcknowledged) {
-      this.emitStatus(sosId, {
-        event: 'rescue_team_acknowledged',
-        sosId,
-        status: 'RESCUE_TEAM_ACKNOWLEDGED',
-        timestamp: current.rescueTeamAcknowledgedAt,
-        isSimulated: true,
-      });
-      return;
-    }
-
-    // Stage 2: LoRa radio transmission starting (after 3 seconds)
-    const t1 = setTimeout(() => {
-      const updated = {
-        ...current,
-        status: 'TRANSMITTING_TO_RESCUE_STATION',
-        transmittingLoRa: true,
-      };
-      saveSOSRecord(updated);
-      this.emitStatus(sosId, {
-        event: 'sos_transmission_started',
-        sosId,
-        status: 'TRANSMITTING_TO_RESCUE_STATION',
-        timestamp: new Date().toISOString(),
-        isSimulated: true,
-        message: 'Broadcasting packet via SX1262 LoRa radio to ground station...',
-      });
-    }, 3000);
-    this.simulationTimers.push(t1);
-
-    // Stage 3: Ground station LoRa ACK received (after 8 seconds)
-    const t2 = setTimeout(async () => {
-      const fresh = await getSOSById(sosId);
-      const ackTime = new Date().toISOString();
-      const updated = {
-        ...fresh,
-        status: 'RECEIVED_BY_GROUND_STATION',
-        transmittingLoRa: false,
-        groundStationAcknowledged: true,
-        groundStationAcknowledgedAt: ackTime,
-      };
-      saveSOSRecord(updated);
-      this.emitStatus(sosId, {
-        event: 'sos_received_by_ground_station',
-        sosId,
-        status: 'RECEIVED_BY_GROUND_STATION',
-        timestamp: ackTime,
-        isSimulated: true,
-        message: 'Ground station confirmed LoRa packet receipt',
-      });
-    }, 8000);
-    this.simulationTimers.push(t2);
-
-    // Stage 4: Rescue Team Human Operator Confirmation (after 14 seconds)
-    const t3 = setTimeout(async () => {
-      const fresh = await getSOSById(sosId);
-      const operatorTime = new Date().toISOString();
-      const updated = {
-        ...fresh,
-        status: 'RESCUE_TEAM_ACKNOWLEDGED',
-        rescueTeamAcknowledged: true,
-        rescueTeamAcknowledgedAt: operatorTime,
-      };
-      saveSOSRecord(updated);
-      this.emitStatus(sosId, {
-        event: 'rescue_team_acknowledged',
-        sosId,
-        status: 'RESCUE_TEAM_ACKNOWLEDGED',
-        timestamp: operatorTime,
-        isSimulated: true,
-        message: 'Rescue coordinator verified emergency details',
-      });
-    }, 14000);
-    this.simulationTimers.push(t3);
   }
 
   emitStatus(sosId, payload) {
@@ -193,9 +142,11 @@ class SOSSocketService {
     }
   }
 
-  clearTimers() {
-    this.simulationTimers.forEach((t) => clearTimeout(t));
-    this.simulationTimers = [];
+  clearPing() {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -203,7 +154,7 @@ class SOSSocketService {
   }
 
   disconnect() {
-    this.clearTimers();
+    this.clearPing();
     if (this.socket) {
       try {
         this.socket.close();
@@ -211,6 +162,7 @@ class SOSSocketService {
       this.socket = null;
     }
     this.isConnected = false;
+    this.isLive = false;
   }
 }
 
