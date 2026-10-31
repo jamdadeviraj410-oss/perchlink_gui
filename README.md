@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # PerchLink – Disaster-Zone SOS Relay Drone
 
 Autonomous emergency communication relay system designed to provide life-saving SOS connectivity in disaster areas where cellular towers and internet infrastructure have failed.
@@ -115,3 +116,6 @@ perchlink/
 │
 └── plan.md                         # Architecture specification
 ```
+=======
+# perchlink_gui
+>>>>>>> origin/main
