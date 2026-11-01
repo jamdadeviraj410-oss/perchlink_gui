@@ -66,6 +66,7 @@ iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8000 || tr
 
 # 7. Setup Python Virtual Environment and Dependencies
 echo "🐍 Setting up Python virtual environment in $PROJECT_DIR/backend/venv..."
+chown -R "$REAL_USER:$REAL_USER" "$PROJECT_DIR"
 if [ ! -d "$PROJECT_DIR/backend/venv" ]; then
   sudo -u "$REAL_USER" python3 -m venv "$PROJECT_DIR/backend/venv"
 fi
